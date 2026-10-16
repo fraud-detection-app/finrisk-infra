@@ -8,7 +8,7 @@ import shutil
 
 import pytest
 
-from conftest import ENVIRONMENTS, ROOT, run
+from conftest import ENVIRONMENTS, GENERATED_DIRS, ROOT, repo_files, run
 
 needs_terraform = pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
 
@@ -58,9 +58,24 @@ def tfvars(path):
     return values
 
 
-@pytest.mark.parametrize("env,compute,days,versioning", [("dev", "lambda", "7", "false"), ("sit", "lambda", "14", "false"), ("pre-prod", "ecs", "30", "true"), ("prod", "ecs", "90", "true")])
-def test_each_environment_has_its_tfvars(env, compute, days, versioning):
-    assert tfvars(ROOT / "envs" / f"{env}.tfvars") == {"env": env, "compute": compute, "log_retention_days": days, "bucket_versioning": versioning}
+# CloudWatch Logs accepts only these retention periods (days). A value outside the list fails at apply time, not at plan time.
+CLOUDWATCH_RETENTION_DAYS = {1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653}
+COMPUTE = {"dev": "lambda", "sit": "lambda", "pre-prod": "ecs", "prod": "ecs"}
+
+
+@pytest.mark.parametrize("env", ENVIRONMENTS)
+def test_each_environment_has_its_tfvars(env):
+    """The CONTRACT of an environment's tfvars, not today's numbers: a pull request that changes a log retention (lab 3 of
+    the course: dev 7 -> 14) or any other tunable must stay green. What is pinned is what the design promises."""
+    values = tfvars(ROOT / "envs" / f"{env}.tfvars")
+    assert set(values) == {"env", "compute", "log_retention_days", "bucket_versioning"}, "the four variables every environment sets"
+    assert values["env"] == env, "the file's env is its name (the workspace guard compares them)"
+    assert values["compute"] == COMPUTE[env], f"{env} runs on {COMPUTE[env]} (dev and sit: Lambda; pre-prod and prod: ECS Express)"
+    assert values["log_retention_days"].isdigit() and int(values["log_retention_days"]) in CLOUDWATCH_RETENTION_DAYS, \
+        f"log_retention_days must be one of CloudWatch's allowed values, not {values['log_retention_days']!r}"
+    assert values["bucket_versioning"] in ("true", "false")
+    if env in ("pre-prod", "prod"):
+        assert values["bucket_versioning"] == "true", f"{env} keeps every object version"
 
 
 def test_every_environment_has_a_test_file_and_there_is_a_guard_test():
@@ -85,13 +100,41 @@ def test_the_workspace_guard_is_a_precondition_not_a_check():
     assert re.search(r'^check "', text, re.M) is None
 
 
-def test_no_account_id_or_secret_is_committed():
-    """A 12-digit number may appear only in tests, as the made-up account of the mock provider."""
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or any(p in path.parts for p in (".terraform", "__pycache__", ".pytest_cache")) or path.suffix == ".pyc":
-            continue
+ACCOUNT_ID = re.compile(r"(?<!\d)\d{12}(?!\d)")
+LONG_HEX = re.compile(r"[0-9a-f]{32,}")             # the lock files' zh: hashes are 64 hex digits: 12 digits in a row can occur inside one
+
+
+def leaks(root=ROOT):
+    """(file, what) for every committed 12-digit number outside tests/ and every key-like string."""
+    found = []
+    for path in repo_files(root):
         text = path.read_text(encoding="utf-8", errors="ignore")
-        in_tests = "tests" in path.relative_to(ROOT).parts
-        for number in re.findall(r"(?<!\d)\d{12}(?!\d)", text):
-            assert in_tests, f"{path}: a 12-digit number outside tests/"
-        assert "AK" "IA" not in text and "BEGIN PRIVATE" " KEY" not in text, path
+        rel = path.relative_to(root)
+        if "tests" not in rel.parts and ACCOUNT_ID.search(LONG_HEX.sub("", text)):
+            found.append((rel.as_posix(), "a 12-digit number outside tests/"))
+        if "AK" "IA" in text or "BEGIN PRIVATE" " KEY" in text:
+            found.append((rel.as_posix(), "a key-like string"))
+    return found
+
+
+def test_no_account_id_or_secret_is_committed():
+    """A 12-digit number may appear only in tests, as the made-up account of the mock provider. Only files git tracks (or would)
+    are scanned: not .git/, .terraform/, .venv/ or caches, which a CI runner or a laptop fills with files that are not ours."""
+    assert leaks() == []
+
+
+def test_the_secret_scan_ignores_generated_folders_but_still_sees_a_leak(tmp_path):
+    for folder in sorted(GENERATED_DIRS):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / "FETCH_HEAD").write_text("123456789012\n")      # what a runner's .git really holds
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_x.py").write_text('ACCOUNT = "123456789012"\n')
+    (tmp_path / "ok.md").write_text("nothing here\n")
+    (tmp_path / "lock.hcl").write_text('hashes = ["zh:ab123456789012cd' + "e" * 48 + '"]\n')                    # 12 digits inside a hash
+    (tmp_path / "other-repo" / ".git").mkdir(parents=True)                       # another repository checked out into a subfolder
+    (tmp_path / "other-repo" / "fakes.py").write_text('ACCOUNT = "123456789012"\n')
+    assert leaks(tmp_path) == []
+    assert sorted(p.name for p in repo_files(tmp_path)) == ["lock.hcl", "ok.md", "test_x.py"]
+    (tmp_path / "envs").mkdir()
+    (tmp_path / "envs" / "dev.tfvars").write_text('role = "arn:aws:iam::123456789012:role/x"\n')
+    assert leaks(tmp_path) == [("envs/dev.tfvars", "a 12-digit number outside tests/")]

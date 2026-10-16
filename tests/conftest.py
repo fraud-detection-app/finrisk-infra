@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 from pathlib import Path
@@ -14,6 +15,31 @@ ROOT = Path(__file__).resolve().parents[1]
 ENVIRONMENTS = ["dev", "sit", "pre-prod", "prod"]
 ORG = "fraud-detection-app"
 REPOS = {"infra": "finrisk-infra", "app": "finrisk-app", "ml": "finrisk-ml", "knowledge": "finrisk-knowledge"}
+
+# Folders that tools generate (or that hold git's own bookkeeping). A scan of "what is committed" must never read them:
+# on a CI runner .git/ contains fetched refs and shas, .terraform/ and .venv/ contain other people's files.
+GENERATED_DIRS = {".git", ".terraform", ".venv", "__pycache__", ".pytest_cache"}
+
+
+def repo_files(root: Path = ROOT) -> list[Path]:
+    """The files of the repository that git tracks (or would track): `git ls-files` when `root` is a git checkout and git
+    is installed, otherwise a walk of the folder that does not enter GENERATED_DIRS or another
+    checkout nested inside it (CI may check a sibling repository out into a subfolder). Either way nothing from a
+    generated folder, and never a .pyc."""
+    names: list[Path] | None = None
+    if (root / ".git").exists() and shutil.which("git"):
+        done = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                              capture_output=True, text=True)
+        if done.returncode == 0:
+            names = [root / n for n in done.stdout.split("\0") if n]
+    if names is None:
+        names = []
+        for folder, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in GENERATED_DIRS and not (Path(folder) / d / ".git").exists()]           # prune: do not even descend
+            names.extend(Path(folder) / f for f in files)
+    return sorted(p for p in names if p.is_file() and p.suffix != ".pyc"
+                  and not GENERATED_DIRS.intersection(p.relative_to(root).parts))
+
 
 # A made-up 12-digit account id. It must never appear in anything the scripts PRINT.
 FAKE_ACCOUNT = "210987654321"

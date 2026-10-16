@@ -4,5 +4,5 @@
 
 env                = "dev"
 compute            = "lambda"
-log_retention_days = 7
+log_retention_days = 14
 bucket_versioning  = false

@@ -1,0 +1,514 @@
+# Offline test of the GitHub OIDC roles (oidc.tf, roles_*.tf). No AWS account is touched: mock_provider fakes the
+# AWS provider, so `terraform test` costs nothing and needs no credentials.
+#
+#   bash scripts/tf_checks.sh bootstrap
+#
+# What it proves: the role table is exactly the one in the course contract; every role trusts ONE repository and
+# ONE subject (deploy/promote roles: their own Environment; build roles: main only; plan: pull requests only);
+# no wildcard anywhere; the plan role cannot change anything; no role is bigger than IAM allows.
+
+mock_provider "aws" {
+  mock_data "aws_caller_identity" {
+    defaults = {
+      account_id = "123456789012"
+    }
+  }
+
+  mock_data "aws_region" {
+    defaults = {
+      region = "ap-southeast-2"
+    }
+  }
+}
+
+variables {
+  github_org = "acme-lab"
+}
+
+# ------------------------------------------------------------------ who may become which role
+run "there_are_exactly_the_roles_of_the_contract" {
+  command = plan
+
+  assert {
+    condition = toset(keys(aws_iam_role.this)) == toset([
+      "finrisk-infra-plan", "finrisk-infra-drift", "finrisk-infra-apply-shared",
+      "finrisk-infra-apply-dev", "finrisk-infra-apply-sit", "finrisk-infra-apply-pre-prod", "finrisk-infra-apply-prod",
+      "finrisk-app-build",
+      "finrisk-app-deploy-dev", "finrisk-app-deploy-sit", "finrisk-app-deploy-pre-prod", "finrisk-app-deploy-prod",
+      "finrisk-ml-train", "finrisk-ml-approve",
+      "finrisk-ml-promote-dev", "finrisk-ml-promote-sit", "finrisk-ml-promote-pre-prod", "finrisk-ml-promote-prod",
+      "finrisk-kb-build",
+      "finrisk-kb-promote-dev", "finrisk-kb-promote-sit", "finrisk-kb-promote-pre-prod", "finrisk-kb-promote-prod",
+    ])
+    error_message = "The role table drifted from the contract (spec 3.2)."
+  }
+
+  assert {
+    condition     = alltrue([for name, r in aws_iam_role.this : r.name == name])
+    error_message = "A role's name must be its table key."
+  }
+}
+
+run "each_role_trusts_exactly_one_subject_of_exactly_one_repository" {
+  command = plan
+
+  # role -> the sub the token must carry. Spelled out here on purpose: this table IS the contract.
+  assert {
+    condition = alltrue([
+      for name, sub in {
+        "finrisk-infra-plan"           = "repo:acme-lab/finrisk-infra:pull_request"
+        "finrisk-infra-drift"          = "repo:acme-lab/finrisk-infra:ref:refs/heads/main"
+        "finrisk-infra-apply-shared"   = "repo:acme-lab/finrisk-infra:environment:infra-shared"
+        "finrisk-infra-apply-dev"      = "repo:acme-lab/finrisk-infra:environment:infra-dev"
+        "finrisk-infra-apply-sit"      = "repo:acme-lab/finrisk-infra:environment:infra-sit"
+        "finrisk-infra-apply-pre-prod" = "repo:acme-lab/finrisk-infra:environment:infra-pre-prod"
+        "finrisk-infra-apply-prod"     = "repo:acme-lab/finrisk-infra:environment:infra-prod"
+        "finrisk-app-build"            = "repo:acme-lab/finrisk-app:ref:refs/heads/main"
+        "finrisk-app-deploy-dev"       = "repo:acme-lab/finrisk-app:environment:dev"
+        "finrisk-app-deploy-sit"       = "repo:acme-lab/finrisk-app:environment:sit"
+        "finrisk-app-deploy-pre-prod"  = "repo:acme-lab/finrisk-app:environment:pre-prod"
+        "finrisk-app-deploy-prod"      = "repo:acme-lab/finrisk-app:environment:prod"
+        "finrisk-ml-train"             = "repo:acme-lab/finrisk-ml:environment:ml"
+        "finrisk-ml-approve"           = "repo:acme-lab/finrisk-ml:environment:model-approval"
+        "finrisk-ml-promote-dev"       = "repo:acme-lab/finrisk-ml:environment:dev"
+        "finrisk-ml-promote-sit"       = "repo:acme-lab/finrisk-ml:environment:sit"
+        "finrisk-ml-promote-pre-prod"  = "repo:acme-lab/finrisk-ml:environment:pre-prod"
+        "finrisk-ml-promote-prod"      = "repo:acme-lab/finrisk-ml:environment:prod"
+        "finrisk-kb-build"             = "repo:acme-lab/finrisk-knowledge:ref:refs/heads/main"
+        "finrisk-kb-promote-dev"       = "repo:acme-lab/finrisk-knowledge:environment:dev"
+        "finrisk-kb-promote-sit"       = "repo:acme-lab/finrisk-knowledge:environment:sit"
+        "finrisk-kb-promote-pre-prod"  = "repo:acme-lab/finrisk-knowledge:environment:pre-prod"
+        "finrisk-kb-promote-prod"      = "repo:acme-lab/finrisk-knowledge:environment:prod"
+      } :
+      jsondecode(aws_iam_role.this[name].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == sub
+    ])
+    error_message = "A role trusts the wrong subject. Every deploy/promote role must name its own repository AND its own Environment."
+  }
+
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this :
+      jsondecode(r.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com"
+    ])
+    error_message = "Every role must require the audience sts.amazonaws.com."
+  }
+
+  # Exact matches only: one condition operator, one sub (a string, not a list), no pattern characters.
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this :
+      keys(jsondecode(r.assume_role_policy).Statement[0].Condition) == ["StringEquals"] &&
+      length(jsondecode(r.assume_role_policy).Statement) == 1 &&
+      !strcontains(r.assume_role_policy, "*") && !strcontains(r.assume_role_policy, "?") &&
+      can(regex("^repo:[^:*?]+/[^:*?]+:", jsondecode(r.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"]))
+    ])
+    error_message = "Trust policies must be a single StringEquals on a single sub, without wildcards."
+  }
+
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this :
+      jsondecode(r.assume_role_policy).Statement[0].Action == "sts:AssumeRoleWithWebIdentity" &&
+      jsondecode(r.assume_role_policy).Statement[0].Principal.Federated == "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    ])
+    error_message = "Roles must be assumed with a web identity from the account's GitHub provider."
+  }
+}
+
+run "build_roles_name_only_main_and_deploy_roles_name_an_environment_and_no_branch" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for name in ["finrisk-app-build", "finrisk-kb-build", "finrisk-infra-drift"] :
+      endswith(jsondecode(aws_iam_role.this[name].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"], ":ref:refs/heads/main") &&
+      !strcontains(aws_iam_role.this[name].assume_role_policy, "environment:") && !strcontains(aws_iam_role.this[name].assume_role_policy, "pull_request")
+    ])
+    error_message = "Build roles (and the drift role) trust the main branch and nothing else."
+  }
+
+  # Every role that changes a stack is reached through an Environment: no branch, no pull request.
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this :
+      strcontains(r.assume_role_policy, ":environment:") || contains(["finrisk-app-build", "finrisk-kb-build", "finrisk-infra-drift", "finrisk-infra-plan"], name)
+    ])
+    error_message = "Only build, drift and plan roles may be reached without an Environment."
+  }
+
+  assert {
+    condition     = !strcontains(aws_iam_role.this["finrisk-infra-plan"].assume_role_policy, "refs/heads") && !strcontains(aws_iam_role.this["finrisk-infra-plan"].assume_role_policy, "environment:")
+    error_message = "The plan role is for pull requests only."
+  }
+
+  # prod must not be reachable as pre-prod, nor the other way round: the sub ends right after the name.
+  assert {
+    condition = alltrue([
+      for prefix in ["finrisk-app-deploy", "finrisk-ml-promote", "finrisk-kb-promote"] :
+      !strcontains(aws_iam_role.this["${prefix}-prod"].assume_role_policy, "pre-prod") && !strcontains(aws_iam_role.this["${prefix}-prod"].assume_role_policy, "environment:dev")
+    ])
+    error_message = "A prod role names another environment."
+  }
+}
+
+run "only_this_organisation_and_these_repositories_are_trusted" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this :
+      startswith(jsondecode(r.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"], "repo:acme-lab/finrisk-")
+    ])
+    error_message = "Every sub must start with repo:<org>/finrisk-."
+  }
+}
+
+# ------------------------------------------------------------------ the identity provider
+run "the_provider_is_created_once_for_github" {
+  command = plan
+
+  assert {
+    condition     = length(aws_iam_openid_connect_provider.github) == 1 && aws_iam_openid_connect_provider.github[0].url == "https://token.actions.githubusercontent.com" && aws_iam_openid_connect_provider.github[0].client_id_list == toset(["sts.amazonaws.com"])
+    error_message = "One GitHub OIDC provider with the audience sts.amazonaws.com."
+  }
+}
+
+run "an_existing_provider_can_be_reused" {
+  command = plan
+
+  variables {
+    create_oidc_provider = false
+  }
+
+  assert {
+    condition     = length(aws_iam_openid_connect_provider.github) == 0
+    error_message = "create_oidc_provider = false must not create a second provider."
+  }
+
+  assert {
+    condition     = jsondecode(aws_iam_role.this["finrisk-app-build"].assume_role_policy).Statement[0].Principal.Federated == "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+    error_message = "The roles must still trust the account's GitHub provider."
+  }
+}
+
+# ------------------------------------------------------------------ the inputs cannot be bent into a wildcard
+run "the_organisation_cannot_contain_a_slash_or_a_wildcard" {
+  command = plan
+
+  variables {
+    github_org = "acme/lab"
+  }
+
+  expect_failures = [var.github_org]
+}
+
+run "a_repository_name_cannot_become_a_wildcard" {
+  command = plan
+
+  variables {
+    repos = {
+      infra     = "finrisk-*"
+      app       = "finrisk-app"
+      ml        = "finrisk-ml"
+      knowledge = "finrisk-knowledge"
+    }
+  }
+
+  expect_failures = [var.repos]
+}
+
+run "the_four_repositories_are_required" {
+  command = plan
+
+  variables {
+    repos = {
+      infra = "finrisk-infra"
+      app   = "finrisk-app"
+    }
+  }
+
+  expect_failures = [var.repos]
+}
+
+# ------------------------------------------------------------------ what each role may do (needs `apply` against the mock)
+run "policies_fit_in_iam_and_nobody_gets_admin" {
+  command = apply
+
+  # IAM allows 10,240 characters of inline policy per role (whitespace excluded; ours is compact JSON, so this is a bound).
+  assert {
+    condition     = alltrue([for name, p in aws_iam_role_policy.this : length(p.policy) < 10240])
+    error_message = "A role's inline policy is over the 10,240 character IAM limit."
+  }
+
+  assert {
+    condition = alltrue([
+      for name, p in aws_iam_role_policy.this :
+      !strcontains(p.policy, "AdministratorAccess") && !strcontains(p.policy, "\"iam:*\"") && !strcontains(p.policy, "\"s3:*\"") &&
+      !strcontains(p.policy, "\"ecr:*\"") && !strcontains(p.policy, "\"ssm:*\"") && !strcontains(p.policy, "\"sagemaker:*\"") &&
+      !strcontains(p.policy, "\"Action\":\"*\"") && !strcontains(p.policy, "\"Action\":[\"*\"")
+    ])
+    error_message = "A policy grants all actions of a service. Only lambda:* on one named function is allowed."
+  }
+
+  # lambda:* exists once per environment, on the one function of that environment.
+  assert {
+    condition = alltrue([
+      for e in ["dev", "sit", "pre-prod", "prod"] :
+      strcontains(aws_iam_role_policy.this["finrisk-app-deploy-${e}"].policy, ":function:finrisk-${e}\"")
+    ])
+    error_message = "Each app deploy role must name its own Lambda function."
+  }
+
+  # Statements without a resource ("*") never carry a write action except the ECR login.
+  assert {
+    condition = alltrue([
+      for name, p in aws_iam_role_policy.this : alltrue([
+        for s in jsondecode(p.policy).Statement :
+        s.Resource != "*" || alltrue([for a in tolist(s.Action) : can(regex("^(ec2|elasticloadbalancing|application-autoscaling|ecs|logs|ssm):(Describe|List)|^ecr:GetAuthorizationToken$", a))])
+      ])
+    ])
+    error_message = "A statement on Resource * may only list/describe (or log in to ECR)."
+  }
+}
+
+run "the_plan_and_drift_roles_cannot_change_anything" {
+  command = apply
+
+  assert {
+    condition = alltrue([
+      for name in ["finrisk-infra-plan", "finrisk-infra-drift"] : alltrue([
+        for s in jsondecode(aws_iam_role_policy.this[name].policy).Statement :
+        alltrue([for a in tolist(s.Action) : can(regex("^[a-z0-9-]+:(Get|List|Describe)", a))])
+      ])
+    ])
+    error_message = "The plan/drift policy contains an action that is not Get*, List* or Describe*."
+  }
+
+  assert {
+    condition     = aws_iam_role_policy.this["finrisk-infra-plan"].policy == aws_iam_role_policy.this["finrisk-infra-drift"].policy
+    error_message = "Plan and drift use the same read-only policy."
+  }
+
+  # No state WRITE and no lock file: the plan runs with -lock=false.
+  assert {
+    condition     = !strcontains(aws_iam_role_policy.this["finrisk-infra-plan"].policy, "tflock") && !strcontains(aws_iam_role_policy.this["finrisk-infra-plan"].policy, "s3:PutObject")
+    error_message = "The plan role must not write state or lock files."
+  }
+}
+
+run "only_apply_shared_may_write_a_repository_policy" {
+  command = apply
+
+  # shared/ecr.tf writes the policy that lets Lambda pull finrisk-app; the app deploy roles stay read-only on it.
+  assert {
+    condition = (
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "ecr:SetRepositoryPolicy") &&
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "ecr:DeleteRepositoryPolicy") &&
+      alltrue([
+        for name, p in aws_iam_role_policy.this :
+        name == "finrisk-infra-apply-shared" || !strcontains(p.policy, "ecr:SetRepositoryPolicy")
+      ])
+    )
+    error_message = "Only finrisk-infra-apply-shared may call ecr:SetRepositoryPolicy."
+  }
+}
+
+run "each_apply_and_deploy_role_touches_only_its_own_environment" {
+  command = apply
+
+  # prod's state, names and parameters never appear in dev's policy, and vice versa.
+  assert {
+    condition = alltrue([
+      for family in ["finrisk-infra-apply", "finrisk-app-deploy"] : alltrue([
+        for e in ["dev", "sit", "pre-prod", "prod"] : alltrue([
+          for other in [for x in ["dev", "sit", "pre-prod", "prod"] : x if x != e] :
+          !strcontains(aws_iam_role_policy.this["${family}-${e}"].policy, "env:/${other}/") &&
+          !strcontains(aws_iam_role_policy.this["${family}-${e}"].policy, "/finrisk/${other}/") &&
+          !strcontains(aws_iam_role_policy.this["${family}-${e}"].policy, "role/finrisk-${other}-") &&
+          !strcontains(aws_iam_role_policy.this["${family}-${e}"].policy, "function:finrisk-${other}\"")
+        ])
+      ])
+    ])
+    error_message = "An apply/deploy policy names another environment's state, parameters, roles or function."
+  }
+
+  # State: the infra stack and the service stack use different objects, each per workspace.
+  assert {
+    condition = alltrue([
+      for e in ["dev", "sit", "pre-prod", "prod"] :
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-${e}"].policy, "env:/${e}/infra/env.tfstate") &&
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-${e}"].policy, "env:/${e}/infra/env.tfstate.tflock") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-infra-apply-${e}"].policy, "app/service.tfstate") &&
+      strcontains(aws_iam_role_policy.this["finrisk-app-deploy-${e}"].policy, "env:/${e}/app/service.tfstate") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-app-deploy-${e}"].policy, "infra/env.tfstate")
+    ])
+    error_message = "Each stack's role reaches only its own state key (infra/env.tfstate vs app/service.tfstate) in its own workspace."
+  }
+
+  assert {
+    condition     = strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "infra/shared.tfstate") && !strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "env:/dev/") && !strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "env:/prod/")
+    error_message = "apply-shared reaches infra/shared.tfstate (default workspace) and no environment's state."
+  }
+}
+
+run "the_app_and_knowledge_and_model_roles_do_exactly_what_the_contract_says" {
+  command = apply
+
+  # app-build: ECR push to finrisk-app only.
+  assert {
+    condition = (
+      strcontains(aws_iam_role_policy.this["finrisk-app-build"].policy, "repository/finrisk-app") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-app-build"].policy, "finrisk-train") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-app-build"].policy, "lambda") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-app-build"].policy, "ssm")
+    )
+    error_message = "app-build pushes to finrisk-app and does nothing else."
+  }
+
+  # ml-train registers but does not approve; approve approves but does not train.
+  assert {
+    condition = (
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "sagemaker:CreateTrainingJob") &&
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "sagemaker:CreateModelPackage") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "UpdateModelPackage") &&
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "repository/finrisk-train") &&
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "iam:PassedToService")
+    )
+    error_message = "ml-train: train + register + push finrisk-train + PassRole to SageMaker, but never approve."
+  }
+
+  assert {
+    condition = (
+      strcontains(aws_iam_role_policy.this["finrisk-ml-approve"].policy, "sagemaker:UpdateModelPackage") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-ml-approve"].policy, "CreateTrainingJob") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-ml-approve"].policy, "ssm:") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-ml-approve"].policy, "s3:")
+    )
+    error_message = "ml-approve changes an approval status and nothing else."
+  }
+
+  # promote roles: the registry (read) + THEIR environment's pointer.
+  assert {
+    condition = alltrue([
+      for e in ["dev", "sit", "pre-prod", "prod"] :
+      strcontains(aws_iam_role_policy.this["finrisk-ml-promote-${e}"].policy, "parameter/finrisk/${e}/model") &&
+      strcontains(aws_iam_role_policy.this["finrisk-ml-promote-${e}"].policy, "parameter/finrisk/${e}/app_url") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-ml-promote-${e}"].policy, "/index") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-ml-promote-${e}"].policy, "UpdateModelPackage") &&
+      strcontains(aws_iam_role_policy.this["finrisk-kb-promote-${e}"].policy, "parameter/finrisk/${e}/index") &&
+      strcontains(aws_iam_role_policy.this["finrisk-kb-promote-${e}"].policy, "parameter/finrisk/${e}/app_url") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-kb-promote-${e}"].policy, "/model")
+    ])
+    error_message = "A promote role moves ONE pointer of ONE environment (ml: model, knowledge: index) and reads app_url."
+  }
+
+  # kb-build: the KB bucket's indexes/ and Titan, in the Region, nothing else.
+  assert {
+    condition = (
+      strcontains(aws_iam_role_policy.this["finrisk-kb-build"].policy, "finrisk-kb-123456789012-ap-southeast-2-an/indexes/*") &&
+      strcontains(aws_iam_role_policy.this["finrisk-kb-build"].policy, "arn:aws:bedrock:ap-southeast-2::foundation-model/amazon.titan-embed-text-v2:0") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-kb-build"].policy, "deepseek") &&
+      !strcontains(aws_iam_role_policy.this["finrisk-kb-build"].policy, "finrisk-ml")
+    )
+    error_message = "kb-build: indexes/* of the KB bucket and the Titan embedding model only."
+  }
+
+  # The names the roles point at are the names shared/ creates (shared/tests/shared.tftest.hcl asserts the same strings).
+  assert {
+    condition = (
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "finrisk-ml-123456789012-ap-southeast-2-an/data/*") &&
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "role/finrisk-sagemaker-exec") &&
+      strcontains(aws_iam_role_policy.this["finrisk-ml-train"].policy, "model-package-group/finrisk-fraud-model") &&
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "repository/finrisk-app") &&
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "repository/finrisk-train") &&
+      strcontains(aws_iam_role_policy.this["finrisk-infra-apply-shared"].policy, "finrisk-kb-123456789012-ap-southeast-2-an")
+    )
+    error_message = "A name in bootstrap no longer matches the one shared/ creates."
+  }
+}
+
+# ------------------------------------------------------------------ what scripts/github_bootstrap.sh reads
+run "outputs_feed_the_github_bootstrap_script" {
+  command = apply
+
+  # Secrets (they hold the account id) and Environment secrets are sensitive; variables are plain.
+  assert {
+    condition     = toset(keys(nonsensitive(output.github_repo_secrets["infra"]))) == toset(["TF_STATE_BUCKET", "AWS_PLAN_ROLE_ARN", "AWS_DRIFT_ROLE_ARN"])
+    error_message = "finrisk-infra secrets."
+  }
+
+  assert {
+    condition     = toset(keys(nonsensitive(output.github_repo_secrets["app"]))) == toset(["TF_STATE_BUCKET", "AWS_BUILD_ROLE_ARN", "ECR_REPOSITORY"])
+    error_message = "finrisk-app secrets."
+  }
+
+  assert {
+    condition     = length(keys(nonsensitive(output.github_repo_secrets["ml"]))) == 0
+    error_message = "finrisk-ml has no repository secrets: its ML names come from SSM."
+  }
+
+  assert {
+    condition     = toset(keys(nonsensitive(output.github_repo_secrets["knowledge"]))) == toset(["KB_BUCKET", "AWS_KB_BUILD_ROLE_ARN"])
+    error_message = "finrisk-knowledge secrets."
+  }
+
+  assert {
+    condition     = nonsensitive(output.github_repo_secrets["app"]["ECR_REPOSITORY"]) == "123456789012.dkr.ecr.ap-southeast-2.amazonaws.com/finrisk-app"
+    error_message = "ECR_REPOSITORY is the full repository URL."
+  }
+
+  assert {
+    condition = (
+      output.github_repo_variables["infra"] == { AWS_REGION = "ap-southeast-2" } &&
+      output.github_repo_variables["app"] == { AWS_REGION = "ap-southeast-2" } &&
+      output.github_repo_variables["knowledge"] == { AWS_REGION = "ap-southeast-2" } &&
+      output.github_repo_variables["ml"] == { AWS_REGION = "ap-southeast-2" }
+    )
+    error_message = "Variables are only the Region (every repo): no account id."
+  }
+
+  assert {
+    condition = (
+      toset(output.github_environments["infra"]) == toset(["infra-dev", "infra-pre-prod", "infra-prod", "infra-shared", "infra-sit"]) &&
+      toset(output.github_environments["app"]) == toset(["dev", "pre-prod", "prod", "sit"]) &&
+      toset(output.github_environments["knowledge"]) == toset(["dev", "pre-prod", "prod", "sit"]) &&
+      toset(output.github_environments["ml"]) == toset(["dev", "ml", "model-approval", "pre-prod", "prod", "sit"])
+    )
+    error_message = "Environments per repository (spec 3.2)."
+  }
+
+  assert {
+    condition = alltrue([
+      for repo, envs in nonsensitive(output.github_environment_secrets) :
+      toset(keys(envs)) == toset(output.github_environments[repo]) && alltrue([for env, s in envs : length(keys(s)) == 1])
+    ])
+    error_message = "Every Environment gets exactly one secret."
+  }
+
+  # ONE naming rule: every Environment's secret is AWS_ROLE_ARN (a job with `environment:` reads secrets.AWS_ROLE_ARN).
+  assert {
+    condition = alltrue([
+      for repo, envs in nonsensitive(output.github_environment_secrets) :
+      alltrue([for env, s in envs : keys(s) == ["AWS_ROLE_ARN"]])
+    ])
+    error_message = "Every Environment of every repository uses the secret name AWS_ROLE_ARN."
+  }
+
+  # ... and holds THAT Environment's role.
+  assert {
+    condition = (
+      nonsensitive(output.github_environment_secrets["ml"]["ml"]["AWS_ROLE_ARN"]) == aws_iam_role.this["finrisk-ml-train"].arn &&
+      nonsensitive(output.github_environment_secrets["ml"]["model-approval"]["AWS_ROLE_ARN"]) == aws_iam_role.this["finrisk-ml-approve"].arn &&
+      nonsensitive(output.github_environment_secrets["ml"]["pre-prod"]["AWS_ROLE_ARN"]) == aws_iam_role.this["finrisk-ml-promote-pre-prod"].arn &&
+      nonsensitive(output.github_environment_secrets["app"]["prod"]["AWS_ROLE_ARN"]) == aws_iam_role.this["finrisk-app-deploy-prod"].arn &&
+      nonsensitive(output.github_environment_secrets["knowledge"]["sit"]["AWS_ROLE_ARN"]) == aws_iam_role.this["finrisk-kb-promote-sit"].arn &&
+      nonsensitive(output.github_environment_secrets["infra"]["infra-shared"]["AWS_ROLE_ARN"]) == aws_iam_role.this["finrisk-infra-apply-shared"].arn
+    )
+    error_message = "An Environment's AWS_ROLE_ARN must be the role of that Environment."
+  }
+
+  assert {
+    condition     = output.github_org == "acme-lab" && output.repositories["knowledge"] == "finrisk-knowledge" && output.aws_region == "ap-southeast-2"
+    error_message = "The script checks the organisation and maps repository keys to names."
+  }
+}

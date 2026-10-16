@@ -1,0 +1,13 @@
+# Made by terraform / tools -- never commit.
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+tfplan.json
+*.tfplan
+crash.log
+outputs.json
+# Python
+__pycache__/
+.pytest_cache/
+.venv/

@@ -6,7 +6,8 @@
 #   finrisk-infra-drift        ...finrisk-infra:ref:refs/heads/main                  the same read-only policy, for the nightly run
 #   finrisk-infra-apply-<s>    ...finrisk-infra:environment:infra-<s>                create/update the resources of scope <s>
 #
-# `subject` below is everything after "repo:<org>/<repo>:" -- oidc.tf puts the rest in front.
+# `subject` below is everything after the repository's prefix ("repo:<org>/<repo>", or its immutable form with the numeric
+# ids) and the colon -- oidc.tf puts the prefix in front.
 
 locals {
   # ---- read-only: shared by plan and drift. Every action is a read; none can change anything.

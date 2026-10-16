@@ -7,15 +7,33 @@
 #      The token lives minutes, and only that job sees it.
 #   2. AWS is told once (the provider below) "trust tokens signed by token.actions.githubusercontent.com".
 #   3. Each role says WHICH tokens may become it. The rule is a condition on the token's `sub` (subject) claim, and it
-#      is an EXACT match -- one repository, one branch or one environment. There is no wildcard anywhere in this file:
+#      is an EXACT match -- one repository, one branch or one environment. There is no wildcard anywhere in this file.
+#      A sub is two parts glued with a colon: a PREFIX that names the repository, and a SUFFIX that names the job:
 #
-#        finrisk-app-build           sub = repo:<org>/finrisk-app:ref:refs/heads/main
-#        finrisk-app-deploy-prod     sub = repo:<org>/finrisk-app:environment:prod
-#        finrisk-infra-plan          sub = repo:<org>/finrisk-infra:pull_request
+#        finrisk-app-build           sub = <prefix of finrisk-app>:ref:refs/heads/main
+#        finrisk-app-deploy-prod     sub = <prefix of finrisk-app>:environment:prod
+#        finrisk-infra-plan          sub = <prefix of finrisk-infra>:pull_request
 #
-#      A job that uses `environment: prod` gets the sub "...:environment:prod". GitHub only starts such a job from
+#      A job that uses `environment: prod` gets the suffix "environment:prod". GitHub only starts such a job from
 #      main and (pre-prod, prod) only after the reviewer approves, so the prod role is reachable only through that gate.
-#      A repository can never use another repository's roles: the repo name is part of the sub.
+#      A repository can never use another repository's roles: the repository is part of the prefix.
+#
+# ---------------------------------------------------------------- why the prefix is read from GitHub
+# Since 15 July 2026 every NEW repository gets an IMMUTABLE subject, and there is no switch to turn it off. The prefix then
+# carries two numbers, the id of the organisation and the id of the repository:
+#
+#        classic    repo:fraud-detection-app/finrisk-infra
+#        immutable  repo:fraud-detection-app@343247080/finrisk-infra@1422750317
+#
+# Why GitHub did it: a name can be reused. Delete a repository (or rename the organisation), and an attacker can create one
+# with the same name and inherit every cloud trust that was written with the NAME. The numeric ids are never reused, so a
+# trust written with them still points at the repository you meant, and only at that one.
+#
+# We keep the EXACT match (no `repo:org/*`, no StringLike), so the numbers have to be in the trust policy, and they are not
+# known until the repository exists. So the order is: create the four empty repositories first, ask GitHub for their prefixes
+# (scripts/oidc_subjects.sh writes oidc_subjects.auto.tfvars.json, which fills var.sub_prefixes), then apply this folder.
+# Where a key is missing from var.sub_prefixes the classic `repo:<org>/<name>` is used (a repository created before the
+# change). If you delete and re-create a repository, its id changes: run the script again and apply again.
 #
 # Roles are defined in roles_infra.tf, roles_app.tf, roles_ml.tf, roles_kb.tf as ONE table (local.roles); this file
 # turns each row into a role with a trust policy and an inline policy (for_each), so adding a role is adding a row.
@@ -63,7 +81,10 @@ locals {
   # The whole table: role name -> { repo, subject, description, statements }.
   roles = merge(local.infra_roles, local.app_roles, local.ml_roles, local.kb_roles)
 
-  # The trust policy: "a token from GitHub, meant for AWS (aud), whose sub is EXACTLY this repository + this subject".
+  # The first part of each repository's sub: what GitHub reported (var.sub_prefixes), or the classic form when none was given.
+  sub_prefix = { for key, name in var.repos : key => lookup(var.sub_prefixes, key, "repo:${var.github_org}/${name}") }
+
+  # The trust policy: "a token from GitHub, meant for AWS (aud), whose sub is EXACTLY this repository's prefix + this subject".
   trust_policy = {
     for name, r in local.roles : name => jsonencode({
       Version = "2012-10-17"
@@ -74,7 +95,7 @@ locals {
         Condition = {
           StringEquals = {
             "${local.github_host}:aud" = "sts.amazonaws.com"
-            "${local.github_host}:sub" = "repo:${var.github_org}/${var.repos[r.repo]}:${r.subject}"
+            "${local.github_host}:sub" = "${local.sub_prefix[r.repo]}:${r.subject}"
           }
         }
       }]

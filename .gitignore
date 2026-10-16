@@ -7,6 +7,7 @@ tfplan.json
 *.tfplan
 crash.log
 outputs.json
+oidc_subjects.auto.tfvars.json
 # Python
 __pycache__/
 .pytest_cache/

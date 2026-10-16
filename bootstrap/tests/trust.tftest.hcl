@@ -163,6 +163,185 @@ run "only_this_organisation_and_these_repositories_are_trusted" {
   }
 }
 
+# ------------------------------------------------------------------ immutable subjects (repositories created after 15 July 2026)
+# GitHub puts the numeric ids of the organisation and the repository into the prefix of the sub. The roles must carry
+# EXACTLY that prefix (still one StringEquals, no wildcard), and still trust only their own repository.
+run "with_immutable_prefixes_every_role_trusts_the_exact_immutable_sub_of_its_repository" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      infra     = "repo:acme-lab@111/finrisk-infra@1001"
+      app       = "repo:acme-lab@111/finrisk-app@1002"
+      ml        = "repo:acme-lab@111/finrisk-ml@1003"
+      knowledge = "repo:acme-lab@111/finrisk-knowledge@1004"
+    }
+  }
+
+  # role -> the sub the token must carry. Spelled out on purpose: this table IS the contract.
+  assert {
+    condition = alltrue([
+      for name, sub in {
+        "finrisk-infra-plan"           = "repo:acme-lab@111/finrisk-infra@1001:pull_request"
+        "finrisk-infra-drift"          = "repo:acme-lab@111/finrisk-infra@1001:ref:refs/heads/main"
+        "finrisk-infra-apply-shared"   = "repo:acme-lab@111/finrisk-infra@1001:environment:infra-shared"
+        "finrisk-infra-apply-dev"      = "repo:acme-lab@111/finrisk-infra@1001:environment:infra-dev"
+        "finrisk-infra-apply-sit"      = "repo:acme-lab@111/finrisk-infra@1001:environment:infra-sit"
+        "finrisk-infra-apply-pre-prod" = "repo:acme-lab@111/finrisk-infra@1001:environment:infra-pre-prod"
+        "finrisk-infra-apply-prod"     = "repo:acme-lab@111/finrisk-infra@1001:environment:infra-prod"
+        "finrisk-app-build"            = "repo:acme-lab@111/finrisk-app@1002:ref:refs/heads/main"
+        "finrisk-app-deploy-dev"       = "repo:acme-lab@111/finrisk-app@1002:environment:dev"
+        "finrisk-app-deploy-sit"       = "repo:acme-lab@111/finrisk-app@1002:environment:sit"
+        "finrisk-app-deploy-pre-prod"  = "repo:acme-lab@111/finrisk-app@1002:environment:pre-prod"
+        "finrisk-app-deploy-prod"      = "repo:acme-lab@111/finrisk-app@1002:environment:prod"
+        "finrisk-ml-train"             = "repo:acme-lab@111/finrisk-ml@1003:environment:ml"
+        "finrisk-ml-approve"           = "repo:acme-lab@111/finrisk-ml@1003:environment:model-approval"
+        "finrisk-ml-promote-dev"       = "repo:acme-lab@111/finrisk-ml@1003:environment:dev"
+        "finrisk-ml-promote-sit"       = "repo:acme-lab@111/finrisk-ml@1003:environment:sit"
+        "finrisk-ml-promote-pre-prod"  = "repo:acme-lab@111/finrisk-ml@1003:environment:pre-prod"
+        "finrisk-ml-promote-prod"      = "repo:acme-lab@111/finrisk-ml@1003:environment:prod"
+        "finrisk-kb-build"             = "repo:acme-lab@111/finrisk-knowledge@1004:ref:refs/heads/main"
+        "finrisk-kb-promote-dev"       = "repo:acme-lab@111/finrisk-knowledge@1004:environment:dev"
+        "finrisk-kb-promote-sit"       = "repo:acme-lab@111/finrisk-knowledge@1004:environment:sit"
+        "finrisk-kb-promote-pre-prod"  = "repo:acme-lab@111/finrisk-knowledge@1004:environment:pre-prod"
+        "finrisk-kb-promote-prod"      = "repo:acme-lab@111/finrisk-knowledge@1004:environment:prod"
+      } :
+      jsondecode(aws_iam_role.this[name].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == sub
+    ])
+    error_message = "With immutable prefixes every role must trust prefix + its own suffix, exactly."
+  }
+
+  # Still exact: one StringEquals, one sub, no pattern characters, the audience unchanged.
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this :
+      keys(jsondecode(r.assume_role_policy).Statement[0].Condition) == ["StringEquals"] &&
+      !strcontains(r.assume_role_policy, "*") && !strcontains(r.assume_role_policy, "?") &&
+      jsondecode(r.assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:aud"] == "sts.amazonaws.com"
+    ])
+    error_message = "Immutable subjects must not loosen the trust policy."
+  }
+
+  # No role trusts another repository's subject: a role of repository X never mentions the id of Y.
+  assert {
+    condition = alltrue([
+      for name, r in aws_iam_role.this : alltrue([
+        for other_id in ["1001", "1002", "1003", "1004"] :
+        strcontains(r.assume_role_policy, "@${other_id}:") == (
+          (startswith(name, "finrisk-infra-") && other_id == "1001") ||
+          (startswith(name, "finrisk-app-") && other_id == "1002") ||
+          (startswith(name, "finrisk-ml-") && other_id == "1003") ||
+          (startswith(name, "finrisk-kb-") && other_id == "1004")
+        )
+      ])
+    ])
+    error_message = "A role names another repository's immutable sub."
+  }
+
+  assert {
+    condition = output.trusted_sub_prefixes == {
+      infra     = "repo:acme-lab@111/finrisk-infra@1001"
+      app       = "repo:acme-lab@111/finrisk-app@1002"
+      ml        = "repo:acme-lab@111/finrisk-ml@1003"
+      knowledge = "repo:acme-lab@111/finrisk-knowledge@1004"
+    }
+    error_message = "The output must show which prefix each repository's roles trust."
+  }
+}
+
+run "a_repository_without_a_prefix_keeps_the_classic_sub" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      infra = "repo:acme-lab@111/finrisk-infra@1001"
+    }
+  }
+
+  assert {
+    condition = alltrue([
+      jsondecode(aws_iam_role.this["finrisk-infra-plan"].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:acme-lab@111/finrisk-infra@1001:pull_request",
+      jsondecode(aws_iam_role.this["finrisk-app-deploy-prod"].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:acme-lab/finrisk-app:environment:prod",
+      jsondecode(aws_iam_role.this["finrisk-ml-approve"].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:acme-lab/finrisk-ml:environment:model-approval",
+      jsondecode(aws_iam_role.this["finrisk-kb-build"].assume_role_policy).Statement[0].Condition.StringEquals["token.actions.githubusercontent.com:sub"] == "repo:acme-lab/finrisk-knowledge:ref:refs/heads/main",
+    ])
+    error_message = "A key missing from sub_prefixes falls back to repo:<org>/<name>; a given key is used as given."
+  }
+}
+
+run "a_prefix_must_be_the_exact_prefix_of_its_own_repository" {
+  command = plan
+
+  # app's prefix under the infra key: the infra roles would trust the app repository.
+  variables {
+    sub_prefixes = {
+      infra = "repo:acme-lab@111/finrisk-app@1002"
+    }
+  }
+
+  expect_failures = [var.sub_prefixes]
+}
+
+run "a_prefix_of_another_organisation_is_refused" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      app = "repo:evil-org@999/finrisk-app@1002"
+    }
+  }
+
+  expect_failures = [var.sub_prefixes]
+}
+
+run "a_prefix_cannot_be_a_wildcard_or_carry_a_suffix" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      app = "repo:acme-lab@111/finrisk-app@*"
+    }
+  }
+
+  expect_failures = [var.sub_prefixes]
+}
+
+run "a_prefix_must_start_with_repo_colon" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      ml = "acme-lab@111/finrisk-ml@1003"
+    }
+  }
+
+  expect_failures = [var.sub_prefixes]
+}
+
+run "a_prefix_cannot_already_hold_a_suffix" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      knowledge = "repo:acme-lab@111/finrisk-knowledge@1004:environment:prod"
+    }
+  }
+
+  expect_failures = [var.sub_prefixes]
+}
+
+run "a_prefix_for_an_unknown_repository_key_is_refused" {
+  command = plan
+
+  variables {
+    sub_prefixes = {
+      other = "repo:acme-lab@111/finrisk-other@1005"
+    }
+  }
+
+  expect_failures = [var.sub_prefixes]
+}
+
 # ------------------------------------------------------------------ the identity provider
 run "the_provider_is_created_once_for_github" {
   command = plan

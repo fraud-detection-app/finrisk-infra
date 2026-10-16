@@ -6,7 +6,7 @@
 # Why by hand? A pipeline needs a role to run, and the role has to be made by somebody. This folder is that
 # somebody's work, done once. Its own state stays on the instructor's laptop (terraform.tfstate, git-ignored),
 # because it cannot live in a bucket it has not created yet. Everything else (shared/, envs/) is applied
-# by GitHub Actions from then on. README.md, "Step 1" shows the commands.
+# by GitHub Actions from then on. README.md, "Doing it for the first time" (steps 1-3) shows the commands.
 #
 # Also once per account, before the first ECS Express Mode service (pre-prod, prod): three service-linked roles.
 # AWS creates them on first use, but a brand-new account's first Express service does not wait for them.

@@ -27,6 +27,17 @@ with open(os.environ["FAKE_LOG"], "a") as f:
     f.write(json.dumps({"tool": "gh", "args": args, "stdin": data}) + "\\n")
 if args[:2] == ["api", "user"]:
     print("4242")
+# GET repos/<org>/<name>/actions/oidc/customization/sub: answer like GitHub does for a repository created after 15 July 2026.
+# FAKE_GH_MISSING = names that do not exist (404); FAKE_GH_CLASSIC = names that report no prefix (an older repository).
+if len(args) >= 2 and args[0] == "api" and args[1].endswith("/actions/oidc/customization/sub"):
+    _, org, name = args[1].split("/")[:3]
+    if name in os.environ.get("FAKE_GH_MISSING", "").split(","):
+        print("gh: Not Found (HTTP 404)", file=sys.stderr); sys.exit(1)
+    if name in os.environ.get("FAKE_GH_CLASSIC", "").split(","):
+        print("null" if "--jq" in args else "{}")
+    else:
+        ids = {"finrisk-infra": 1422750317, "finrisk-app": 1422750390, "finrisk-ml": 1422750465, "finrisk-knowledge": 1422750548}
+        print(f"repo:{org}@343247080/{name}@{ids.get(name, 1422759999)}")
 '''
 
 FAKE_TERRAFORM = '''#!/usr/bin/env python3

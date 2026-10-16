@@ -50,7 +50,7 @@
 #
 # Options:
 #   --apply               do it (default: dry run)
-#   --bootstrap-dir DIR   where `terraform output` runs (default: bootstrap/ of this repository; after Step 1 of the
+#   --bootstrap-dir DIR   where `terraform output` runs (default: bootstrap/ of this repository; after Step 2 of the
 #                         README that is ~/terraform-labs/finrisk-bootstrap)
 #   --outputs-file FILE   read `terraform output -json` from FILE instead of running terraform (offline use, tests)
 #   --reviewer-ids 1,2    GitHub numeric USER ids for the reviewers (default: your own, looked up with `gh api user`)
@@ -108,7 +108,7 @@ if [ -n "$OUTPUTS_FILE" ]; then
 else
   command -v terraform >/dev/null || { echo "terraform is not installed (or pass --outputs-file)." >&2; exit 1; }
   if ! terraform -chdir="$BOOTSTRAP_DIR" output -json > "$OUT" 2>/dev/null || [ ! -s "$OUT" ] || [ "$(tr -d '[:space:]' < "$OUT")" = "{}" ]; then
-    echo "No outputs from $BOOTSTRAP_DIR. Apply bootstrap first (once, as an admin user): see README.md, Step 1." >&2
+    echo "No outputs from $BOOTSTRAP_DIR. Apply bootstrap first (once, as an admin user): see README.md, steps 1-3." >&2
     exit 1
   fi
 fi
@@ -120,7 +120,7 @@ jget() { python3 "$READER" "$OUT" get "$@"; }
 TRUSTED="$(jget github_org)"
 if [ "$TRUSTED" != "$ORG" ]; then
   echo "WARNING: the AWS roles trust the organisation '$TRUSTED' but you are configuring '$ORG'." >&2
-  echo "         GitHub's token says repo:<org>/<repo> exactly (case matters); AWS will refuse any other. Fix with:" >&2
+  echo "         GitHub's token names <org> exactly (case matters; its numeric ids come from oidc_subjects.sh); AWS will refuse any other. Fix with:" >&2
   echo "         terraform -chdir=$BOOTSTRAP_DIR apply -var github_org=$ORG" >&2
   if [ "$APPLY" = 1 ]; then echo "Stopping (nothing was changed)." >&2; exit 1; fi
 fi

@@ -35,7 +35,7 @@ endgroup() { if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::endgroup::"; fi; }
 for stack in "${STACKS[@]}"; do
   case "$stack" in bootstrap|shared|envs) ;; *) echo "unknown stack '$stack' (bootstrap, shared or envs)" >&2; exit 2 ;; esac
   mkdir -p "$work/$stack"
-  (cd "$here/$stack" && tar cf - --exclude .terraform --exclude 'terraform.tfstate*' --exclude tfplan .) | (cd "$work/$stack" && tar xf -)
+  (cd "$here/$stack" && tar cf - --exclude .terraform --exclude 'terraform.tfstate*' --exclude tfplan --exclude 'oidc_subjects.auto.tfvars.json' .) | (cd "$work/$stack" && tar xf -)
   rm -f "$work/$stack/backend.tf"
 
   group "$stack: terraform fmt -check"

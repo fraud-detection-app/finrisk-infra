@@ -72,6 +72,11 @@ output "repositories" {
   value       = var.repos
 }
 
+output "trusted_sub_prefixes" {
+  description = "Repository key -> the first part of the sub claim every role of that repository trusts (immutable form with numeric ids, or classic). Compare it with what GitHub reports: bash scripts/oidc_subjects.sh <org>."
+  value       = local.sub_prefix
+}
+
 output "aws_region" {
   description = "The Region everything lives in."
   value       = local.region

@@ -5,7 +5,7 @@
 # The exact provider version is recorded in .terraform.lock.hcl -- commit that file.
 #
 # There is NO backend block: bootstrap keeps LOCAL state (terraform.tfstate next to these files), because it
-# creates the bucket that every other stack keeps its state in. See the README, "Step 1".
+# creates the bucket that every other stack keeps its state in. See the README, "Doing it for the first time".
 
 terraform {
   required_version = ">= 1.15"

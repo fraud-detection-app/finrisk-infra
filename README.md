@@ -41,7 +41,7 @@ environment** (a workspace each), **one IAM role per environment and pipeline**,
 bootstrap/   by hand, once      state bucket, GitHub OIDC provider, ALL roles for the four repositories (local state)
 shared/      pipeline           ECR finrisk-app + finrisk-train, ML bucket, KB bucket, SageMaker role + model group, /finrisk/shared/*
 envs/        pipeline           per environment (workspace = env): bucket, log group, runtime role, ECS roles, /finrisk/<env>/*
-scripts/     tf.sh (init/plan/apply for a scope) - tf_checks.sh (offline checks) - github_bootstrap.sh - plan_summary.py
+scripts/     tf.sh (init/plan/apply for a scope) - tf_checks.sh (offline checks) - oidc_subjects.sh - github_bootstrap.sh - plan_summary.py
 .github/workflows/   infra-ci.yml - infra-deliver.yml - drift.yml
 tests/       pytest (scripts, workflows, lock files) - bootstrap/tests, shared/tests, envs/tests hold the `terraform test` files
 ```
@@ -69,9 +69,12 @@ plan fails before anything changes). The `app/service.tfstate` key belongs to fi
 
 ## The IAM roles (all created in `bootstrap/`)
 
-Every role trusts **one** GitHub token: `aud = sts.amazonaws.com` and an **exact** `sub`. No wildcard anywhere.
+Every role trusts **one** GitHub token: `aud = sts.amazonaws.com` and an **exact** `sub`. No wildcard anywhere. A `sub` is the
+repository's **prefix** plus a **suffix** that names the job. For a repository created after 15 July 2026 the prefix is the
+immutable form `repo:<org>@<org id>/<repo>@<repo id>` (read from GitHub by `scripts/oidc_subjects.sh`, passed in as
+`sub_prefixes`); for an older repository it is the classic `repo:<org>/<repo>`.
 
-| Role | Who may become it (`sub` after `repo:<org>/<repo>:`) | May do (by name) |
+| Role | Who may become it (the suffix after the repository's prefix and `:`) | May do (by name) |
 | --- | --- | --- |
 | `finrisk-infra-plan` | `finrisk-infra` `pull_request` | read state, Describe/Get/List. Nothing else |
 | `finrisk-infra-drift` | `finrisk-infra` `ref:refs/heads/main` | the same read-only policy, for the nightly run (added: a schedule has no `pull_request` sub) |
@@ -127,22 +130,45 @@ aws iam create-service-linked-role --aws-service-name elasticloadbalancing.amazo
 aws iam create-service-linked-role --aws-service-name ecs.application-autoscaling.amazonaws.com
 ```
 
-**1. Bootstrap (by hand, once).** Its state is **local**, because it creates the bucket the other stacks keep their state in.
-Work **outside iCloud/Dropbox** in a folder you will not delete, and keep `terraform.tfstate` there (it is your only record of these
-resources; it is git-ignored in this repository):
+**1. Create the four EMPTY public repositories** (no README, no license: nothing to push yet). They come first on purpose: since
+15 July 2026 GitHub gives every new repository an *immutable subject*, a `sub` that carries the numeric ids of the organisation and
+of the repository (`repo:fraud-detection-app@343247080/finrisk-infra@1422750317:...`), and there is no setting to switch that off.
+Our roles trust the **exact** `sub` (no wildcard), so they need those ids, and a repository has its ids only after it exists.
+(Why GitHub did it: a name can be reused by an attacker after you delete a repository; an id never is.)
 
 ```bash
-mkdir -p ~/terraform-labs && cp -R bootstrap ~/terraform-labs/finrisk-bootstrap && cd ~/terraform-labs/finrisk-bootstrap
+for r in finrisk-infra finrisk-app finrisk-ml finrisk-knowledge; do gh repo create fraud-detection-app/$r --public; done
+```
+
+**2. Copy `bootstrap/` out of iCloud/Dropbox and read the subject prefixes.** Its state is **local**, because it creates the bucket
+the other stacks keep their state in. Work in a folder you will not delete, and keep `terraform.tfstate` there (it is your only
+record of these resources; it is git-ignored in this repository). The script only *reads* GitHub (four GET calls) and writes
+`oidc_subjects.auto.tfvars.json`, which Terraform loads by itself:
+
+```bash
+mkdir -p ~/terraform-labs && cp -R bootstrap ~/terraform-labs/finrisk-bootstrap
+bash scripts/oidc_subjects.sh fraud-detection-app --out ~/terraform-labs/finrisk-bootstrap
+```
+
+**3. Bootstrap (by hand, once).**
+
+```bash
+cd ~/terraform-labs/finrisk-bootstrap
 export TF_PLUGIN_CACHE_DIR=~/.terraform.d/plugin-cache; mkdir -p "$TF_PLUGIN_CACHE_DIR"
 terraform init
-terraform plan          # read it: 23 roles, 23 policies, 1 provider, 1 bucket (+ its settings)
+terraform plan          # read it: 23 roles, 23 policies, 1 provider, 1 bucket (+ its settings). In each role's trust policy
+                        # look for the `sub`: it must read repo:fraud-detection-app@<id>/finrisk-...@<id>:<job>
 terraform apply         # -var create_oidc_provider=false if week 13a's practice repo already made the GitHub provider
 ```
 
-**2. Create the four repositories** in the organisation (public) and push the first commit of each. (`protect-main` blocks direct
-pushes, so push *before* step 3. Each repository's first workflow run will fail because its secrets do not exist yet: ignore it.)
+If you delete and re-create a repository, or rename the organisation, its ids change: run `oidc_subjects.sh` again and
+`terraform apply` again (23 roles updated in place), or the job fails with *Not authorized to perform sts:AssumeRoleWithWebIdentity*.
 
-**3. Configure GitHub from the outputs.** A dry run first (it prints every command, account ids hidden, and calls nothing):
+**4. Push the first commit of each repository** into the empty repository (`git remote add origin ...`, `git push -u origin main`).
+(`protect-main` blocks direct pushes, so push *before* step 5. Each repository's first workflow run will fail because its secrets do
+not exist yet: ignore it.)
+
+**5. Configure GitHub from the outputs.** A dry run first (it prints every command, account ids hidden, and calls nothing):
 
 ```bash
 bash scripts/github_bootstrap.sh fraud-detection-app --bootstrap-dir ~/terraform-labs/finrisk-bootstrap
@@ -152,10 +178,10 @@ bash scripts/github_bootstrap.sh fraud-detection-app --bootstrap-dir ~/terraform
 It sets variables, secrets, Environments (reviewers, `main`-only branch policy), the Environment secrets and the rulesets for
 all four repositories. Safe to repeat. (`terraform output -json` prints the secret values: never paste its output anywhere.)
 
-**4. First delivery.** Actions -> `infra-deliver` -> *Run workflow*. It applies `shared`, then each environment; approve the
+**6. First delivery.** Actions -> `infra-deliver` -> *Run workflow*. It applies `shared`, then each environment; approve the
 Environments with a reviewer when GitHub asks. When it is green, the other three repositories can run.
 
-**5. From now on** every change is a pull request: read the `plan` summary, merge, watch the stages.
+**7. From now on** every change is a pull request: read the `plan` summary, merge, watch the stages.
 
 ## Tests
 
@@ -166,7 +192,7 @@ bash scripts/tf_checks.sh               # fmt, validate, terraform test (mock pr
 ```
 
 `tf_checks.sh` works in a temporary copy, so nothing lands in your checkout. The `terraform test` files prove, with a *mock* AWS
-provider (no account needed): every role trusts exactly one repository and one subject; the plan role cannot change anything; no
+provider (no account needed): every role trusts exactly one repository and one subject (classic or immutable, never a wildcard, never another repository's); the plan role cannot change anything; no
 role names another environment; the SSM names are the contract's; the pointers ignore value changes; the workspace guard works.
 
 ## Drift, in one paragraph

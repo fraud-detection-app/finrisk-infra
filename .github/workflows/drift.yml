@@ -1,0 +1,63 @@
+# drift -- every night (and on demand): does the real AWS still match the code on main?
+#
+# `terraform plan -detailed-exitcode` per scope: exit 0 = nothing to do, exit 2 = something differs, exit 1 = error.
+# Exit 2 FAILS the job and the summary lists the addresses ("Changed outside Terraform" = somebody edited it by hand;
+# a pending change = main has something not applied yet). Read-only: role finrisk-infra-drift, OIDC sub
+# `ref:refs/heads/main`, the same read-only policy as the pull-request plan role; it takes no lock and creates nothing.
+#
+# GitHub switches scheduled workflows off after 60 days without a push to a public repository: if the nightly run
+# stops, open the Actions tab and press "Enable workflow".
+
+name: drift
+
+on:
+  schedule:
+    - cron: "17 17 * * *" # 17:17 UTC = 03:17 in Sydney
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  drift:
+    name: drift (${{ matrix.scope }})
+    # The drift role trusts main only: a manual run from another branch could not assume it.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    strategy:
+      fail-fast: false # one scope's drift must not hide another's
+      matrix:
+        scope: [shared, dev, sit, pre-prod, prod]
+    env:
+      SCOPE: ${{ matrix.scope }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_READ_ONLY: "1"
+      TF_DRIFT: "1" # plan -detailed-exitcode; exit 2 = drift
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DRIFT_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: "Plan -detailed-exitcode (exit 2 = drift, the job fails and lists the addresses)"
+        run: bash scripts/tf.sh plan "$SCOPE"

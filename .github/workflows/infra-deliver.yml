@@ -1,0 +1,226 @@
+# infra-deliver -- a merge to main that touches shared/ or envs/ (or a manual run) changes AWS, one stage at a time:
+#
+#   apply-shared  ->  apply-dev  ->  apply-sit  ->  apply-pre-prod  ->  apply-prod
+#   infra-shared      infra-dev      infra-sit      infra-pre-prod       infra-prod         (GitHub Environments)
+#   (reviewer)                                      (reviewer)           (reviewer)
+#
+# Every stage: terraform init -> plan -out tfplan (summary: + ~ - and the addresses) -> apply tfplan. The plan that
+# was shown is the plan that is applied. Each stage assumes ITS OWN role (finrisk-infra-apply-<scope>, OIDC sub
+# `environment:infra-<scope>`) through the Environment's secret AWS_ROLE_ARN; GitHub starts the job only from main and,
+# where a reviewer is set, only after approval.
+#
+# One run at a time (concurrency): two runs would fight over the same state. While a run waits for an approval, a newer
+# push queues behind it; GitHub keeps only the newest queued run.
+#
+# First time in an account: bootstrap/ and scripts/github_bootstrap.sh come first (README.md, Steps 1-3), then start
+# this workflow by hand (Actions -> infra-deliver -> Run workflow) -- the push that created the repository could not run
+# it, because the Environments did not exist yet.
+
+name: infra-deliver
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "shared/**"
+      - "envs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-deliver
+  cancel-in-progress: false
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  apply-shared:
+    name: apply shared
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: infra-shared
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      SCOPE: shared
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: Plan (saved as tfplan) and the + ~ - summary
+        run: bash scripts/tf.sh plan "$SCOPE"
+
+      - name: Apply exactly that plan
+        run: bash scripts/tf.sh apply "$SCOPE"
+
+  apply-dev:
+    name: apply dev
+    needs: apply-shared
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: infra-dev
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      SCOPE: dev
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: Plan (saved as tfplan) and the + ~ - summary
+        run: bash scripts/tf.sh plan "$SCOPE"
+
+      - name: Apply exactly that plan
+        run: bash scripts/tf.sh apply "$SCOPE"
+
+  apply-sit:
+    name: apply sit
+    needs: apply-dev
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: infra-sit
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      SCOPE: sit
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: Plan (saved as tfplan) and the + ~ - summary
+        run: bash scripts/tf.sh plan "$SCOPE"
+
+      - name: Apply exactly that plan
+        run: bash scripts/tf.sh apply "$SCOPE"
+
+  apply-pre-prod:
+    name: apply pre-prod
+    needs: apply-sit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: infra-pre-prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      SCOPE: pre-prod
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: Plan (saved as tfplan) and the + ~ - summary
+        run: bash scripts/tf.sh plan "$SCOPE"
+
+      - name: Apply exactly that plan
+        run: bash scripts/tf.sh apply "$SCOPE"
+
+  apply-prod:
+    name: apply prod
+    needs: apply-pre-prod
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    environment: infra-prod
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      SCOPE: prod
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: Plan (saved as tfplan) and the + ~ - summary
+        run: bash scripts/tf.sh plan "$SCOPE"
+
+      - name: Apply exactly that plan
+        run: bash scripts/tf.sh apply "$SCOPE"

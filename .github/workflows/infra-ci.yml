@@ -1,0 +1,146 @@
+# infra-ci -- every pull request to main. Two required checks (ruleset protect-main): `terraform-checks` and `plan`.
+#
+#   terraform-checks   Offline: terraform fmt, validate and `terraform test` against a MOCK AWS provider (no account, no
+#                      credentials), plus the repository's own pytest. Runs for every pull request, forks included.
+#   plan-scope (x5)    What WOULD change in AWS: shared, dev, sit, pre-prod, prod. Role finrisk-infra-plan (read-only,
+#                      OIDC sub `pull_request`). The job summary shows + ~ - counts and the addresses.
+#   plan               The one check the ruleset waits for: collects the five plans into one table and fails if any
+#                      scope failed. (A matrix job is named "plan (dev)" etc., so a separate job called exactly `plan`
+#                      is what a required check can point at.)
+#
+# A FORK pull request has no secrets and no OIDC token: GitHub withholds both from forks on purpose. The plan scopes are
+# skipped, `plan` says so in its summary and passes, and `terraform-checks` still gates the merge. A maintainer who
+# wants a plan for a fork's change pushes it to a branch of THIS repository.
+#
+# No `paths:` filter on purpose: a required check that never starts (because no matching file changed) stays
+# "Expected" forever and blocks the merge.
+
+name: infra-ci
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: infra-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# Every job runs on ubuntu-24.04, the image this pipeline was rehearsed on. `ubuntu-latest` moves to Ubuntu 26 on
+# 19 Oct 2026; pin the runner like you pin actions, and move to a new image on purpose, in a pull request.
+jobs:
+  terraform-checks:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install the test tools
+        run: pip install pytest pyyaml
+
+      - name: Terraform fmt, validate and terraform test (bootstrap, shared, envs)
+        run: bash scripts/tf_checks.sh
+
+      - name: The repository's own tests (scripts, workflows, trust table)
+        run: python -m pytest -q -m "not terraform"
+
+  plan-scope:
+    name: plan (${{ matrix.scope }})
+    # Forks get no OIDC token and no secrets: nothing to run here.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      id-token: write # lets the job ask GitHub for its OIDC token
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        scope: [shared, dev, sit, pre-prod, prod]
+    env:
+      SCOPE: ${{ matrix.scope }}
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      STATE_BUCKET: ${{ secrets.TF_STATE_BUCKET }}
+      TF_READ_ONLY: "1" # the plan role cannot write: no lock, no new workspace
+      SUMMARY_FILE: summaries/summary-${{ matrix.scope }}.md
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.15.8
+          terraform_wrapper: false
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Hide the account id in this (public) log
+        run: echo "::add-mask::$(aws sts get-caller-identity --query Account --output text)"
+
+      - name: Init (state in S3)
+        run: bash scripts/tf.sh init "$SCOPE"
+
+      - name: Plan (and the + ~ - summary)
+        run: |
+          mkdir -p summaries
+          bash scripts/tf.sh plan "$SCOPE"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plan-${{ matrix.scope }}
+          path: summaries/summary-${{ matrix.scope }}.md
+          retention-days: 1
+          if-no-files-found: ignore
+
+  plan:
+    name: plan
+    needs: plan-scope
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fork pull request - no plan possible
+        if: github.event.pull_request.head.repo.full_name != github.repository
+        run: |
+          {
+            echo "## Terraform plan skipped"
+            echo
+            echo "This pull request comes from a fork. GitHub gives fork pull requests no secrets and no OIDC token, so AWS"
+            echo "cannot be reached and no plan can run. \`terraform-checks\` (offline) still ran. To see the plan, push this"
+            echo "change to a branch of this repository and open the pull request from there."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/download-artifact@v8
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true # none exist when every scope failed
+        with:
+          pattern: plan-*
+          path: summaries
+          merge-multiple: true
+
+      - name: One table for all five plans
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        run: |
+          mkdir -p summaries
+          python3 scripts/plan_summary.py combine summaries >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if any scope failed
+        if: needs.plan-scope.result != 'success' && needs.plan-scope.result != 'skipped'
+        run: |
+          echo "::error::At least one plan failed or was cancelled (${{ needs.plan-scope.result }}). Open the plan (<scope>) job."
+          exit 1

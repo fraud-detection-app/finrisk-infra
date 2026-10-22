@@ -445,12 +445,12 @@ run "policies_fit_in_iam_and_nobody_gets_admin" {
     error_message = "Each app deploy role must name its own Lambda function."
   }
 
-  # Statements without a resource ("*") never carry a write action except the ECR login.
+  # Statements without a resource ("*") never carry a write action except the ECR logins (private and public).
   assert {
     condition = alltrue([
       for name, p in aws_iam_role_policy.this : alltrue([
         for s in jsondecode(p.policy).Statement :
-        s.Resource != "*" || alltrue([for a in tolist(s.Action) : can(regex("^(ec2|elasticloadbalancing|application-autoscaling|ecs|logs|ssm):(Describe|List)|^ecr:GetAuthorizationToken$|^sagemaker:List(EndpointConfigs|Models)$", a))])
+        s.Resource != "*" || alltrue([for a in tolist(s.Action) : can(regex("^(ec2|elasticloadbalancing|application-autoscaling|ecs|logs|ssm):(Describe|List)|^ecr:GetAuthorizationToken$|^ecr-public:GetAuthorizationToken$|^sts:GetServiceBearerToken$|^sagemaker:List(EndpointConfigs|Models)$", a))])
       ])
     ])
     error_message = "A statement on Resource * may only list/describe (or log in to ECR)."
@@ -549,6 +549,16 @@ run "the_app_and_knowledge_and_model_roles_do_exactly_what_the_contract_says" {
       !strcontains(aws_iam_role_policy.this["finrisk-app-build"].policy, "ssm")
     )
     error_message = "app-build pushes to finrisk-app and does nothing else."
+  }
+
+  # app-build may sign in to ECR Public (pulling the Lambda Web Adapter anonymously hits the 500 GB/month limit), and only
+  # the build role may: no other role pulls public images.
+  assert {
+    condition = alltrue([
+      for name, p in aws_iam_role_policy.this :
+      strcontains(p.policy, "ecr-public:GetAuthorizationToken") == (name == "finrisk-app-build")
+    ])
+    error_message = "Only finrisk-app-build signs in to ECR Public."
   }
 
   # ml-train STARTS the pipelines and the backfill; it neither trains, registers nor approves itself (the pipeline does, with the

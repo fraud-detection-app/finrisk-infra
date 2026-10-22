@@ -22,6 +22,16 @@ locals {
       Action   = local.ecr_push_actions
       Resource = "${local.arn_ecr}/${local.ecr_app}"
     },
+    {
+      # The release image copies the Lambda Web Adapter from ECR Public (public.ecr.aws). Anonymous pulls from GitHub's
+      # shared runner addresses run into ECR Public's 500 GB/month limit ("429 Too Many Requests: Data limit exceeded",
+      # 22 Oct 2026); signed in, the pull counts against this account. Logging in to ECR Public needs both actions, and
+      # neither has a resource. They only read public images: nothing can be pushed with them.
+      Sid      = "EcrPublicLoginToPullBaseImages"
+      Effect   = "Allow"
+      Action   = ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"]
+      Resource = "*"
+    },
   ]
 
   # One deploy role per environment. The service stack (finrisk-app/deploy/terraform) creates the Lambda function

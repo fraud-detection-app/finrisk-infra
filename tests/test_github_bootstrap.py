@@ -121,6 +121,8 @@ def test_ruleset_protect_main_requires_the_agreed_checks(run_env, outputs_file, 
     assert {"deletion", "non_fast_forward", "pull_request", "required_status_checks"} <= kinds
     status = next(r for r in ruleset["rules"] if r["type"] == "required_status_checks")
     assert [c["context"] for c in status["parameters"]["required_status_checks"]] == CHECKS[key]
+    # up to date with main: the checks ran on exactly the code a squash merge puts on main, so what deploys was tested
+    assert status["parameters"]["strict_required_status_checks_policy"] is True
     assert ruleset["bypass_actors"] == []
 
 

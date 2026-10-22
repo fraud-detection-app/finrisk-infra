@@ -256,10 +256,10 @@ configure_repo() {
     if [ -n "$e" ]; then put_secret "$repo" "$n" "$v" "$e"; fi
   done < <(python3 "$READER" "$OUT" env-secrets "$key")
 
-  step "6/6  Ruleset protect-main (pull request + required checks, no force-push, no deletion)"
+  step "6/6  Ruleset protect-main (pull request + required checks on a branch that is up to date with main, no force-push, no deletion)"
   local contexts="" c
   for c in $(checks_for "$key"); do contexts="${contexts:+$contexts,}{\"context\":\"$c\"}"; done
-  ensure_ruleset "$repo" "protect-main" "{\"name\":\"protect-main\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":$BYPASS,\"conditions\":{\"ref_name\":{\"include\":[\"refs/heads/main\"],\"exclude\":[]}},\"rules\":[{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"},$PR_RULE,{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":false,\"required_status_checks\":[$contexts]}}]}"
+  ensure_ruleset "$repo" "protect-main" "{\"name\":\"protect-main\",\"target\":\"branch\",\"enforcement\":\"active\",\"bypass_actors\":$BYPASS,\"conditions\":{\"ref_name\":{\"include\":[\"refs/heads/main\"],\"exclude\":[]}},\"rules\":[{\"type\":\"deletion\"},{\"type\":\"non_fast_forward\"},$PR_RULE,{\"type\":\"required_status_checks\",\"parameters\":{\"strict_required_status_checks_policy\":true,\"required_status_checks\":[$contexts]}}]}"
 }
 
 for key in $KEYS; do configure_repo "$key"; done
